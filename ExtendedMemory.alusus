@@ -1,0 +1,191 @@
+import "Srl/Memory";
+import "Apm";
+Apm.importFile("Alusus/Threading");
+
+@merge module Srl {
+    @merge module Memory {
+        // Preallocation Data
+
+        class Block {
+            def nextBlock: ref[Block](nullRef[Block]);
+            def memoryBlockSize: ArchInt;
+            def memoryBlockEnlargementSize: ArchInt;
+            def currentAllocationPosition: ArchInt;
+            def lastAllocationStart: ArchInt;
+            def allocationCount: ArchInt;
+
+            handler this.getRemainingSize(): ArchInt {
+                return this.memoryBlockSize - this.currentAllocationPosition;
+            }
+
+            handler this.allocate(size: ArchInt): ptr {
+                def allocSize: ArchInt = size + ArchInt~size; // Add space to store the allocation size;
+                if allocSize > this.getRemainingSize() return 0;
+                // Pad the size to the nearest ArchInt boundary.
+                def remainder: ArchInt = allocSize % ArchInt~size;
+                if remainder != 0 allocSize += ArchInt~size - remainder;
+                this.lastAllocationStart = this.currentAllocationPosition;
+                this.currentAllocationPosition += allocSize;
+                ++this.allocationCount;
+                def p: ptr[ArchInt] = (this~ptr~cast[ptr] + Block~size + this.lastAllocationStart)~cast[ptr[ArchInt]];
+                p~cnt = size;
+                return p + 1;
+            }
+
+            handler this.free(p: ptr): Bool {
+                def start: ArchInt = this~ptr~cast[ArchInt] + Block~size;
+                if p~cast[ArchInt] >= start and p~cast[ArchInt] < start + this.memoryBlockSize {
+                    --this.allocationCount;
+                    return true;
+                }
+                if this.nextBlock~ptr != 0 return this.nextBlock.free(p);
+                return false;
+            }
+
+            handler this.isLastAllocation(p: ptr): Bool {
+                return this~ptr~cast[ptr] + Block~size + this.lastAllocationStart + ArchInt~size == p;
+            }
+
+            handler this.canEnlargeLastAllocation(newSize: ArchInt): Bool {
+                return this.lastAllocationStart + newSize + ArchInt~size <= this.memoryBlockSize;
+            }
+
+            handler this.enlargeLastAllocation(newSize: ArchInt) {
+                def allocSize: ArchInt = newSize + ArchInt~size;
+                def remainder: ArchInt = allocSize % ArchInt~size;
+                if remainder != 0 allocSize += ArchInt~size - remainder;
+                this.currentAllocationPosition = this.lastAllocationStart + allocSize;
+                (this~ptr~cast[ptr] + Block~size + this.lastAllocationStart)~cast[ptr[ArchInt]]~cnt = newSize;
+            }
+
+            handler this.isPreallocated(p: ptr): Bool {
+                def start: ArchInt = this~ptr~cast[ArchInt] + Block~size;
+                if p~cast[ArchInt] >= start and p~cast[ArchInt] < start + this.memoryBlockSize return true;
+                if this.nextBlock~ptr != 0 return this.nextBlock.isPreallocated(p);
+                return false;
+            }
+        }
+
+        def key: Threading.Key;
+        def keyInitialized: Bool(0);
+
+        func destructBlock(val: ptr) {
+            if val != 0 {
+                val~cast[ptr[Block]]~cnt~terminate();
+                Memory.sysFree(val);
+            }
+        }
+
+        func initializePreallocation {
+            if not keyInitialized {
+                Threading.createKey(key~ptr, destructBlock~ptr);
+                keyInitialized = true;
+            }
+            overrideAllocator(
+                _paAlloc~ptr, _paRealloc~ptr, _paAlignedAlloc~ptr, _paFree~ptr
+            );
+        }
+
+        func cleanupPreallocation {
+            resetAllocator();
+        }
+
+        func getCurrentBlock(): ref[Block] {
+            def block: ptr[Block] = Threading.getSpecific(key)~cast[ptr[Block]];
+            return block~cnt;
+        }
+
+        func setCurrentBlock(block: ref[Block]) {
+            Threading.setSpecific(key, block~ptr);
+        }
+
+        // Preallocation Setup
+
+        func startPreallocation(size: ArchInt, enlargementSize: ArchInt): ptr {
+            def block: ref[Block];
+            block~ptr = sysAlloc(Block~size + size)~cast[ptr[Block]];
+            block.nextBlock~no_deref = getCurrentBlock();
+            block.memoryBlockSize = size;
+            block.memoryBlockEnlargementSize = enlargementSize;
+            block.currentAllocationPosition = 0;
+            block.lastAllocationStart = 0;
+            block.allocationCount = 0;
+            setCurrentBlock(block);
+            return block~ptr;
+        }
+
+        func endPreallocation(block: ptr) {
+            endPreallocation(block, false);
+        }
+
+        func endPreallocation(block: ptr, printLog: Bool) {
+            def totalAllocations: ArchInt = 0;
+            def totalSize: ArchInt = 0;
+            def currentBlock: ref[Block](getCurrentBlock());
+            while currentBlock~ptr != 0 {
+                totalAllocations += currentBlock.allocationCount;
+                totalSize += currentBlock.currentAllocationPosition;
+                def nextBlock: ref[Block](currentBlock.nextBlock);
+                sysFree(currentBlock~ptr);
+                if currentBlock~ptr == block {
+                    currentBlock~no_deref = nextBlock;
+                    break;
+                }
+                currentBlock~no_deref = nextBlock;
+            }
+            setCurrentBlock(currentBlock);
+            if printLog {
+                Console.print(
+                    "%sPreallocation End%s - Total unfreed allocations: %ld. Total allocated size: %ld\n",
+                    Console.Style.FG_YELLOW, Console.Style.RESET,
+                    totalAllocations, totalSize
+                );
+            }
+        }
+
+        func runWithPreallocation(size: ArchInt, enlargementSize: ArchInt, printLog: Bool, toRun: closure()) {
+            def p: ptr = startPreallocation(size, enlargementSize);
+            toRun();
+            endPreallocation(p, printLog);
+        }
+
+        // Custom Allocators
+
+        func _paAlloc(size: ArchInt): ptr {
+            def currentBlock: ref[Block](getCurrentBlock());
+            if currentBlock~ptr == 0 or size + ArchInt~size > currentBlock.memoryBlockEnlargementSize {
+                return sysAlloc(size);
+            }
+            def retVal: ptr = currentBlock.allocate(size);
+            if retVal == 0 {
+                startPreallocation(currentBlock.memoryBlockEnlargementSize, currentBlock.memoryBlockEnlargementSize);
+                return _paAlloc(size);
+            }
+            return retVal;
+        }
+
+        func _paRealloc(p: ptr, newSize: ArchInt): ptr {
+            def currentBlock: ref[Block](getCurrentBlock());
+            if currentBlock~ptr == 0 or not currentBlock.isPreallocated(p) return sysRealloc(p, newSize);
+            if currentBlock.isLastAllocation(p) and currentBlock.canEnlargeLastAllocation(newSize) {
+                currentBlock.enlargeLastAllocation(newSize);
+                return p;
+            }
+            def newP: ptr = _paAlloc(newSize);
+            copy(newP, p, (p~cast[ptr[ArchInt]] - 1)~cnt);
+            _paFree(p);
+            return newP;
+        }
+
+        func _paAlignedAlloc(alignment: ArchInt, size: ArchInt): ptr {
+            return _paAlloc(size);
+        }
+
+        func _paFree(p: ptr) {
+            def currentBlock: ref[Block](getCurrentBlock());
+            if currentBlock~ptr == 0 or not currentBlock.free(p) {
+                sysFree(p);
+            }
+        }
+    }
+}

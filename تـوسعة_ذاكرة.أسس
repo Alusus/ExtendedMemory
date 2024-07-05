@@ -1,0 +1,10 @@
+اشمل "مـتم/ذاكـرة"؛
+اشمل "ExtendedMemory.alusus"؛
+
+@دمج وحدة مـتم {
+    @دمج وحدة ذاكـرة {
+        عرف ابدأ_الحجز_المسبق: لقب startPreallocation؛
+        عرف أنه_الحجز_المسبق: لقب endPreallocation؛
+        عرف نفذ_مع_حجز_مسبق: لقب runWithPreallocation؛
+    }
+}
